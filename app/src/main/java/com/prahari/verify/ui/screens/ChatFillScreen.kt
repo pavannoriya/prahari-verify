@@ -48,12 +48,42 @@ private data class LoanOption(val customer: VerifyCustomer, val category: String
 private sealed interface PendingChoice {
     data class Centers(val options: List<VerifyCenter>, val centerNo: String) : PendingChoice
     data class Loans(val options: List<LoanOption>, val memberName: String) : PendingChoice
+    data class Members(val options: List<CenterMember>, val name: String) : PendingChoice
 }
 
-/** "395/20" ya "395/20 laxmi" (+ "/" ke aas-paas spaces) -> (centerNo, memberNo, naam) */
+/**
+ * "395/20" ya "395/20 laxmi" (+ "/" ke aas-paas spaces) -> (centerNo, memberNo, naam).
+ * "385 Seeta" ya "385 ki Seeta" -> (centerNo, "", "Seeta") — NAAM MODE:
+ * member number ke bajay seedha naam se dhoondho (memberNo khaali = naam mode).
+ */
 private fun parseChatInput(raw: String): Triple<String, String, String>? {
-    val m = Regex("""^(\d+)\s*/\s*(\d+)\s*(.*)$""").find(raw.trim()) ?: return null
-    return Triple(m.groupValues[1], m.groupValues[2], m.groupValues[3].trim())
+    val t = raw.trim()
+    if (t.isEmpty()) return null
+    val slash = Regex("""^(\d+)\s*/\s*(\d+)\s*(.*)$""").find(t)
+    if (slash != null) {
+        return Triple(slash.groupValues[1], slash.groupValues[2], slash.groupValues[3].trim())
+    }
+    // Naam mode: "<centerNo> <naam>" ya "<centerNo> ki <naam>"
+    val parts = t.split(Regex("\\s+")).filter { it.isNotBlank() }
+    if (parts.size >= 2 && parts[0].all { it.isDigit() }) {
+        val rest = parts.drop(1)
+        // "ki" particle hatado ("385 ki Seeta" -> "Seeta")
+        val nameParts = if (rest.firstOrNull()?.equals("ki", ignoreCase = true) == true) rest.drop(1) else rest
+        val name = nameParts.joinToString(" ").trim()
+        if (name.isNotBlank()) return Triple(parts[0], "", name)
+    }
+    return null
+}
+
+/** Naam match: barabar ho, ya ek doosre me aata ho ("Seeta" ~ "Seeta Bai") */
+private fun nameMatches(input: String, name: String): Boolean {
+    val inp = input.trim().lowercase()
+    val nm = name.trim().lowercase()
+    if (inp.isEmpty() || nm.isEmpty()) return false
+    if (inp == nm) return true
+    val inpN = inp.split(Regex("\\s+")).joinToString(" ")
+    val nmN = nm.split(Regex("\\s+")).joinToString(" ")
+    return nmN.contains(inpN) || inpN.contains(nmN)
 }
 
 /** Code ka aakhri ":" segment (center code "Jab:NAR:187:285" -> "285") */
@@ -206,7 +236,8 @@ fun ChatFillScreen(
         if (parsed == null) {
             addBot(
                 "Samajh nahi aaya. Aise likho: 395/20 ya 395/20 laxmi " +
-                    "(center number / member number, naam optional hai)",
+                    "(center number / member number) ya 385 Seeta " +
+                    "(center number + member ka naam)",
                 isError = true
             )
             return
@@ -469,6 +500,13 @@ fun ChatFillScreen(
         )
 
         // ---- b. Member dhoondho (disbursements primary, customers fallback) ----
+        // Number mode: code/memberNo se. Naam mode ("385 Seeta"): naam se.
+        val isNameMode = memberNo.isBlank()
+        val matchesMember: (CenterMember) -> Boolean = if (isNameMode) {
+            { nameMatches(typedName, it.memberName) }
+        } else {
+            { codeMatches(memberNo, it.customerCode) || codeMatches(memberNo, it.memberNo) }
+        }
         addBot("Center $centerNoShown ke members la raha hun…")
         val asOn = todayAsOnDate()
         var memberMatches: List<CenterMember> = emptyList()
@@ -476,8 +514,7 @@ fun ChatFillScreen(
         if (disbR.isSuccess) {
             val rows = disbR.getOrNull() ?: emptyList()
             addBot("Disbursements se ${rows.size} rows mile.")
-            memberMatches = rows
-                .filter { codeMatches(memberNo, it.customerCode) || codeMatches(memberNo, it.memberNo) }
+            memberMatches = rows.filter(matchesMember)
         } else {
             addBot(
                 "Disbursement list se nahi mila " +
@@ -489,7 +526,7 @@ fun ChatFillScreen(
             if (custR.isSuccess) {
                 val fallback = custR.getOrNull() ?: emptyList()
                 addBot("Customer list se ${fallback.size} rows mile.")
-                val found = fallback.filter { codeMatches(memberNo, it.customerCode) || codeMatches(memberNo, it.memberNo) }
+                val found = fallback.filter(matchesMember)
                 if (found.isNotEmpty()) {
                     memberMatches = found
                     addBot("Customer list se member mila.")
@@ -499,17 +536,42 @@ fun ChatFillScreen(
             }
         }
         if (memberMatches.isEmpty()) {
-            addBot("Center $centerNoShown me member $memberNo nahi mila.", isError = true)
+            val who = if (isNameMode) typedName else memberNo
+            addBot("Center $centerNoShown me member $who nahi mila.", isError = true)
             return
+        }
+        // Naam mode me ek naam ke alag-alag members hon to chuno (kabhi guess nahi).
+        // Ek hi member ke kayi loans hon to wo ek hi member hai — options nahi.
+        if (isNameMode) {
+            val distinctMembers = memberMatches.distinctBy {
+                it.memberNo.ifBlank { it.customerCode }
+            }
+            if (distinctMembers.size > 1) {
+                val idx = awaitChoice(
+                    PendingChoice.Members(distinctMembers, typedName),
+                    "Center $centerNoShown me '$typedName' naam ke ${distinctMembers.size} members mile — sahi wala chuno:"
+                )
+                if (idx < 0) {
+                    addBot("Theek hai, ye command chhod diya.")
+                    return
+                }
+                val picked = distinctMembers[idx]
+                val pickedKey = picked.memberNo.ifBlank { picked.customerCode }
+                memberMatches = memberMatches.filter {
+                    it.memberNo.ifBlank { it.customerCode } == pickedKey
+                }
+            }
         }
         val memberName = memberMatches.firstOrNull { it.memberName.isNotBlank() }?.memberName ?: ""
         addBot(
-            "Member mil gaya: ${memberName.ifBlank { "Member $memberNo" }} " +
+            "Member mil gaya: ${memberName.ifBlank { typedName.ifBlank { "Member $memberNo" } }} " +
                 "(code: ${memberMatches[0].customerCode.ifBlank { "—" }})"
         )
 
         // ---- c. Naam cross-check (galat client kabhi fill nahi hoga) ----
-        if (typedName.isNotBlank()) {
+        // Sirf number mode me (jab naam alag se likha ho). Naam mode me naam
+        // hi search key tha, isliye dobara cross-check ki zaroorat nahi.
+        if (typedName.isNotBlank() && memberNo.isNotBlank()) {
             if (memberName.isBlank()) {
                 addBot(
                     "Tumne likha $typedName, lekin record me is member ka naam khaali hai — " +
@@ -532,12 +594,15 @@ fun ChatFillScreen(
         }
 
         // ---- d. NTB/NTC/ETB list me loan dhoondho ----
+        // Pehle ID se (loan ID / info ID — IDs ab parse ke waqt normalize hoti
+        // hain, isliye "11506854.0" vs "11506854" ka farak nahi padta). ID se na
+        // mile to center + naam se (yehi "member mila par list 0" wali dikkat ka hal hai).
         addBot("NTB / NTC / ETB list me is loan ko dhoondh raha hun…")
         val disbIds = memberMatches.map { it.disbursementId }
             .filter { it.isNotBlank() }.distinct()
         val memberInfoId = memberMatches
             .firstOrNull { it.customerInfoId.isNotBlank() }?.customerInfoId ?: ""
-        val found = mutableListOf<LoanOption>()
+        val listsByCat = mutableMapOf<String, List<VerifyCustomer>>()
         val listErrors = mutableListOf<String>()
         for (cat in PrahariApi.CATEGORIES) {
             val listR = app.prahariApi.getCustomerList(audit.branchName, branchId, cat)
@@ -545,20 +610,33 @@ fun ChatFillScreen(
                 listErrors.add("$cat: ${listR.exceptionOrNull()?.message}")
                 continue
             }
-            val list = listR.getOrNull() ?: emptyList()
+            listsByCat[cat] = listR.getOrNull() ?: emptyList()
+        }
+        val found = mutableListOf<LoanOption>()
+        for ((cat, list) in listsByCat) {
             for (entry in list) {
                 val hit = when {
                     // Loan ID mile to wahi pakka pehchaan hai (exact match)
                     disbIds.isNotEmpty() -> entry.disbursementId in disbIds
                     // Loan ID na mile to customer info ID se
                     memberInfoId.isNotBlank() -> entry.customerInfoId == memberInfoId
-                    // Dono na mile to center + naam se (aakhri upaay; zyada mile to options dikhenge)
-                    else -> entry.centerId == center.centerId &&
-                        entry.clientName.isNotBlank() && memberName.isNotBlank() &&
-                        entry.clientName.equals(memberName, ignoreCase = true)
+                    else -> false
                 }
                 if (hit) found.add(LoanOption(entry, cat))
             }
+        }
+        if (found.isEmpty() && memberName.isNotBlank()) {
+            // Fallback: center + naam (ID format farak ho tab bhi mile)
+            for ((cat, list) in listsByCat) {
+                for (entry in list) {
+                    val centerOk = (entry.centerId.isNotBlank() && center.centerId.isNotBlank() &&
+                        entry.centerId == center.centerId) || entryCenterMatches(centerNo, entry)
+                    if (centerOk && nameMatches(memberName, entry.clientName)) {
+                        found.add(LoanOption(entry, cat))
+                    }
+                }
+            }
+            if (found.isNotEmpty()) addBot("Loan ID se nahi mila, center + naam se mila.")
         }
         val uniqueFound = found.distinctBy {
             it.category + "|" + it.customer.disbursementId + "|" + it.customer.customerInfoId
@@ -626,7 +704,8 @@ fun ChatFillScreen(
         }
         Spacer(Modifier.height(8.dp))
         Text(
-            "Likho: center number / member number (naam optional) — jaise 395/20 ya 395/20 laxmi",
+            "Likho: center / member number — jaise 395/20 ya 395/20 laxmi — " +
+                "ya center + naam, jaise 385 Seeta",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -755,6 +834,21 @@ fun ChatFillScreen(
                                         Spacer(Modifier.height(4.dp))
                                     }
                                 }
+                                is PendingChoice.Members -> {
+                                    for ((i, m) in choice.options.withIndex()) {
+                                        OutlinedButton(
+                                            onClick = { onChoiceTapped(i) },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text(
+                                                "${m.memberName.ifBlank { "Member" }} " +
+                                                    "(${m.customerCode.ifBlank { m.memberNo.ifBlank { "—" } }})" +
+                                                    if (m.disbursedAmount.isNotBlank()) " • ₹${m.disbursedAmount}" else ""
+                                            )
+                                        }
+                                        Spacer(Modifier.height(4.dp))
+                                    }
+                                }
                             }
                             OutlinedButton(
                                 onClick = { onChoiceCancelled() },
@@ -790,7 +884,7 @@ fun ChatFillScreen(
                 placeholder = {
                     Text(
                         if (pendingChoice != null) "Pehle upar se ek option chuno"
-                        else "Jaise: 395/20 laxmi"
+                        else "Jaise: 395/20 laxmi ya 385 Seeta"
                     )
                 }
             )
