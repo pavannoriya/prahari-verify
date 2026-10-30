@@ -76,8 +76,8 @@ fun VerificationListScreen(
         loading = true; error = null
         VerifySession.category = category
         scope.launch {
-            val countsR = app.prahariApi.getCounts(auditId, branchId, category)
-            val listR = app.prahariApi.getCustomerList(auditId, branchId, category)
+            val countsR = app.prahariApi.getCounts(VerifySession.branchName, branchId, category)
+            val listR = app.prahariApi.getCustomerList(VerifySession.branchName, branchId, category)
             loading = false
             if (countsR.isSuccess) counts = countsR.getOrNull()
             if (listR.isSuccess) {
@@ -175,7 +175,7 @@ fun VerificationListScreen(
             }
             bulkRunning = false
             // Counts dobara lo taaki progress taaza dikhe
-            val countsR = app.prahariApi.getCounts(auditId, branchId, category)
+            val countsR = app.prahariApi.getCounts(VerifySession.branchName, branchId, category)
             if (countsR.isSuccess) counts = countsR.getOrNull()
         }
     }
