@@ -76,19 +76,26 @@ fun VerificationListScreen(
         loading = true; error = null
         VerifySession.category = category
         scope.launch {
-            val countsR = app.prahariApi.getCounts(VerifySession.branchName, branchId, category)
-            val listR = app.prahariApi.getCustomerList(VerifySession.branchName, branchId, category)
-            loading = false
-            if (countsR.isSuccess) counts = countsR.getOrNull()
-            if (listR.isSuccess) {
-                customers = listR.getOrNull() ?: emptyList()
-                if (countsR.isFailure) {
-                    // List mil gayi, counts nahi — counts ki galti dikhao, list mat chhupao
-                    error = "Counts nahi mile: ${countsR.exceptionOrNull()?.message}"
-                }
-            } else {
-                error = listR.exceptionOrNull()?.message
+            try {
+                val countsR = app.prahariApi.getCounts(VerifySession.branchName, branchId, category)
+                val listR = app.prahariApi.getCustomerList(VerifySession.branchName, branchId, category)
+                loading = false
                 if (countsR.isSuccess) counts = countsR.getOrNull()
+                if (listR.isSuccess) {
+                    customers = listR.getOrNull() ?: emptyList()
+                    if (countsR.isFailure) {
+                        // List mil gayi, counts nahi — counts ki galti dikhao, list mat chhupao
+                        error = "Counts nahi mile: ${countsR.exceptionOrNull()?.message}"
+                    }
+                } else {
+                    error = listR.exceptionOrNull()?.message
+                    if (countsR.isSuccess) counts = countsR.getOrNull()
+                }
+            } catch (e: Exception) {
+                // Load ke dauraan koi ankahee galti ho to app band hone ke
+                // bajay error dikhao (crash safety net).
+                loading = false
+                error = "Load me dikkat: ${e.message}"
             }
         }
     }
