@@ -86,6 +86,37 @@ private fun codeMatches(input: String, code: String): Boolean {
     return false
 }
 
+/** Code ke ":" segments (khaali hatakar) */
+private fun codeSegments(code: String): List<String> =
+    code.split(":").map { it.trim() }.filter { it.isNotEmpty() }
+
+/** Poore code ke aakhri DO segments center + member hon (numeric-normalized) */
+private fun pairMatches(centerNo: String, memberNo: String, code: String): Boolean {
+    val segs = codeSegments(code)
+    if (segs.size < 2) return false
+    val last = segs.last()
+    val secondLast = segs[segs.size - 2]
+    val memberOk = memberNo.equals(last, ignoreCase = true) || numbersEqual(memberNo, last)
+    val centerOk = centerNo.equals(secondLast, ignoreCase = true) || numbersEqual(centerNo, secondLast)
+    return memberOk && centerOk
+}
+
+/**
+ * List entry ka center+member match: customerCode se (poora code), ya centerCode
+ * se (agar centerCode hi poora customer code ho). List-first resolution isi par
+ * chalti hai — selected-centers ki zaroorat nahi padti.
+ */
+private fun entryPairMatches(centerNo: String, memberNo: String, entry: VerifyCustomer): Boolean {
+    return pairMatches(centerNo, memberNo, entry.customerCode) ||
+        pairMatches(centerNo, memberNo, entry.centerCode)
+}
+
+/** List entry ka center match: centerCode ka aakhri segment, ya centerId barabar ho */
+private fun entryCenterMatches(centerNo: String, entry: VerifyCustomer): Boolean {
+    return codeMatches(centerNo, entry.centerCode) ||
+        codeMatches(centerNo, entry.centerId)
+}
+
 /** as_on_date ke liye aaj ki date (yyyy-MM-dd) */
 private fun todayAsOnDate(): String =
     SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
@@ -193,35 +224,238 @@ fun ChatFillScreen(
             return
         }
 
-        // ---- a. Center dhoondho ----
-        addBot("Center $centerNo dhoondh raha hun…")
-        val centersR = app.prahariApi.getSelectedCenters(auditId)
-        if (centersR.isFailure) {
-            addBot("Center list nahi mili: ${centersR.exceptionOrNull()?.message}", isError = true)
-            return
-        }
-        val centers = centersR.getOrNull() ?: emptyList()
-        val centerMatches = centers.filter { codeMatches(centerNo, it.centerCode) }
-        val center: VerifyCenter = when {
-            centerMatches.isEmpty() -> {
+        // ---- e. Fill (helper — list-direct aur normal, dono raston se) ----
+        // Section (e) ka wahi code: master + VerifyEngine.fillOne (skip-if-verified
+        // + save + dobara padhkar verify) + result message.
+        suspend fun doFill(
+            loan: LoanOption,
+            center: VerifyCenter,
+            centerNoShown: String,
+            memberMatches: List<CenterMember>
+        ) {
+            val entry = loan.customer
+            val auditorId = app.secureStorage.getAuditorId()
+            if (auditorId.isNullOrBlank()) {
                 addBot(
-                    "Center $centerNo nahi mila (is audit me ${centers.size} centers mile). " +
-                        "Center number dobara check karo.",
+                    "Auditor ID nahi mila. Prahari Connect me Auditor ID dalo, phir dobara try karo.",
                     isError = true
                 )
                 return
             }
-            centerMatches.size == 1 -> centerMatches[0]
-            else -> {
-                val idx = awaitChoice(
-                    PendingChoice.Centers(centerMatches, centerNo),
-                    "Center $centerNo ke ${centerMatches.size} matches mile — sahi wala chuno:"
+            val masterR = app.prahariApi.getChecklistMaster(loan.category)
+            if (masterR.isFailure) {
+                addBot(
+                    "Checklist master nahi mila (${loan.category}): ${masterR.exceptionOrNull()?.message}",
+                    isError = true
                 )
-                if (idx < 0) {
-                    addBot("Theek hai, ye command chhod diya.")
+                return
+            }
+            val fillCustomer = entry.copy(
+                centerId = entry.centerId.ifBlank { center.centerId },
+                centerCode = entry.centerCode.ifBlank { center.centerCode },
+                disbursedAmount = entry.disbursedAmount.ifBlank {
+                    memberMatches.firstOrNull { it.disbursedAmount.isNotBlank() }?.disbursedAmount ?: ""
+                }
+            )
+            addBot("Fill kar raha hun: ${fillCustomer.clientName} (${loan.category})…")
+            val result = VerifyEngine.fillOne(
+                api = app.prahariApi,
+                auditId = auditId,
+                auditorId = auditorId,
+                branchId = branchId,
+                category = loan.category,
+                customer = fillCustomer,
+                master = masterR.getOrNull() ?: emptyList(),
+                values = VerifyEngine.defaultValuesFor(fillCustomer)
+            )
+            when (result.status) {
+                VerifyResult.Status.VERIFIED -> addBot(
+                    "✅ Verified: ${fillCustomer.clientName} • Center $centerNoShown • " +
+                        "Loan ${fillCustomer.disbursementId} • ₹${fillCustomer.disbursedAmount} • ${loan.category}"
+                )
+                VerifyResult.Status.SKIPPED_ALREADY_VERIFIED -> addBot(
+                    "⏭️ Pehle se verified: ${fillCustomer.clientName} • Center $centerNoShown • " +
+                        "Loan ${fillCustomer.disbursementId} • ${loan.category} — dobara fill nahi kiya."
+                )
+                else -> addBot(
+                    "❌ Fill fail: ${fillCustomer.clientName} • Loan ${fillCustomer.disbursementId} • " +
+                        "${loan.category} — ${result.message}",
+                    isError = true
+                )
+            }
+        }
+
+        // ---- a0. Verification lists se seedha match (selected-centers ki zaroorat nahi) ----
+        // Gadarwara jaise audits me selected-centers khaali milta hai (0 centers),
+        // lekin NTB/NTC/ETB list me center+member ki jaankari hoti hai — isliye
+        // pehle list se match karo. List se centerId bhi mil jaata hai, jo
+        // member-lookup (disbursements) ke liye chahiye.
+        addBot("NTB / NTC / ETB list la raha hun…")
+        val earlyLists = mutableListOf<Pair<String, VerifyCustomer>>()
+        val earlyErrors = mutableListOf<String>()
+        for (cat in PrahariApi.CATEGORIES) {
+            val listR = app.prahariApi.getCustomerList(auditId, branchId, cat)
+            if (listR.isFailure) {
+                earlyErrors.add("$cat: ${listR.exceptionOrNull()?.message}")
+                continue
+            }
+            for (entry in listR.getOrNull() ?: emptyList()) {
+                earlyLists.add(cat to entry)
+            }
+        }
+        if (earlyLists.isEmpty() && earlyErrors.isNotEmpty()) {
+            addBot(
+                "Verification list nahi mili (${earlyErrors.joinToString("; ")}) — " +
+                    "phir bhi center-selection se try kar raha hun…"
+            )
+        }
+        // Direct: center+member dono list entry se mile
+        val directFound = earlyLists
+            .filter { entryPairMatches(centerNo, memberNo, it.second) }
+            .map { LoanOption(it.second, it.first) }
+            .distinctBy { it.category + "|" + it.customer.disbursementId + "|" + it.customer.customerInfoId }
+        if (directFound.isNotEmpty()) {
+            val directLoan: LoanOption = when {
+                directFound.size == 1 -> directFound[0]
+                else -> {
+                    val idx = awaitChoice(
+                        PendingChoice.Loans(directFound, directFound[0].customer.clientName),
+                        "Is member ke ${directFound.size} loans list me mile — sahi wala chuno:"
+                    )
+                    if (idx < 0) {
+                        addBot("Theek hai, ye command chhod diya.")
+                        return
+                    }
+                    directFound[idx]
+                }
+            }
+            val directEntry = directLoan.customer
+            if (typedName.isNotBlank()) {
+                if (directEntry.clientName.isBlank()) {
+                    addBot(
+                        "Tumne likha $typedName, lekin list me is client ka naam khaali hai — " +
+                            "naam verify nahi ho paya, isliye fill nahi kar raha.",
+                        isError = true
+                    )
                     return
                 }
-                centerMatches[idx]
+                if (!directEntry.clientName.contains(typedName, ignoreCase = true)) {
+                    addBot(
+                        "Tumne likha $typedName, list me mili hui client ${directEntry.clientName} hai — " +
+                            "naam match nahi hua, isliye fill NAHI kar raha.",
+                        isError = true
+                    )
+                    return
+                }
+                addBot("Naam match ho gaya: ${directEntry.clientName} ✓")
+            }
+            addBot(
+                "List se mil gaya: ${directEntry.clientName} • ${directLoan.category} • " +
+                    "Loan ${directEntry.disbursementId} • ₹${directEntry.disbursedAmount}"
+            )
+            val directCenter = VerifyCenter(
+                centerId = directEntry.centerId,
+                centerCode = directEntry.centerCode,
+                centerName = ""
+            )
+            val directCenterNoShown = lastSegment(directEntry.centerCode).ifBlank { centerNo }
+            doFill(directLoan, directCenter, directCenterNoShown, emptyList())
+            return
+        }
+        // Center list se: centerId nikal lo (selected-centers ke bina member-lookup ke liye)
+        var centerFromList: VerifyCenter? = null
+        val listCenters = earlyLists
+            .filter { entryCenterMatches(centerNo, it.second) && it.second.centerId.isNotBlank() }
+            .map {
+                VerifyCenter(
+                    centerId = it.second.centerId,
+                    centerCode = it.second.centerCode,
+                    centerName = ""
+                )
+            }
+            .distinctBy { it.centerId }
+        if (listCenters.size == 1) {
+            centerFromList = listCenters[0]
+        } else if (listCenters.size > 1) {
+            val idx = awaitChoice(
+                PendingChoice.Centers(listCenters, centerNo),
+                "Center $centerNo ke ${listCenters.size} matches list me mile — sahi wala chuno:"
+            )
+            if (idx < 0) {
+                addBot("Theek hai, ye command chhod diya.")
+                return
+            }
+            centerFromList = listCenters[idx]
+        }
+
+        // ---- a0b. Branch ke saare centers (Visit Plan wala tareeka) ----
+        // Selected-centers khaali ho tab bhi branch ke centers se centerId mil jaata hai.
+        var centerFromBranch: VerifyCenter? = null
+        if (centerFromList == null) {
+            val bName = audit.branchName
+            if (bName.isBlank()) {
+                addBot("Branch ka naam nahi mila, isliye branch-centers skip kar raha hun…")
+            } else {
+                addBot("Branch ($bName) ke saare centers la raha hun…")
+                val branchCentersR = app.prahariApi.getCentersByBranch(bName)
+                if (branchCentersR.isFailure) {
+                    addBot("Branch centers nahi mile: ${branchCentersR.exceptionOrNull()?.message}")
+                } else {
+                    val branchCenters = branchCentersR.getOrNull() ?: emptyList()
+                    val branchMatches = branchCenters.filter { codeMatches(centerNo, it.centerCode) }
+                    if (branchMatches.size == 1) {
+                        centerFromBranch = branchMatches[0]
+                    } else if (branchMatches.size > 1) {
+                        val idx = awaitChoice(
+                            PendingChoice.Centers(branchMatches, centerNo),
+                            "Center $centerNo ke ${branchMatches.size} matches branch me mile — sahi wala chuno:"
+                        )
+                        if (idx < 0) {
+                            addBot("Theek hai, ye command chhod diya.")
+                            return
+                        }
+                        centerFromBranch = branchMatches[idx]
+                    }
+                }
+            }
+        }
+
+        // ---- a. Center dhoondho (list/branch se mil gaya ho to selected-centers skip) ----
+        val center: VerifyCenter = if (centerFromList != null) {
+            centerFromList
+        } else if (centerFromBranch != null) {
+            centerFromBranch
+        } else {
+            addBot("Center $centerNo dhoondh raha hun…")
+            val centersR = app.prahariApi.getSelectedCenters(auditId)
+            if (centersR.isFailure) {
+                addBot("Center list nahi mili: ${centersR.exceptionOrNull()?.message}", isError = true)
+                return
+            }
+            val centers = centersR.getOrNull() ?: emptyList()
+            val centerMatches = centers.filter { codeMatches(centerNo, it.centerCode) }
+            when {
+                centerMatches.isEmpty() -> {
+                    addBot(
+                        "Center $centerNo nahi mila — verification list me bhi nahi, " +
+                            "aur is audit ki selected-centers list me bhi ${centers.size} centers mile. " +
+                            "Center number dobara check karo.",
+                        isError = true
+                    )
+                    return
+                }
+                centerMatches.size == 1 -> centerMatches[0]
+                else -> {
+                    val idx = awaitChoice(
+                        PendingChoice.Centers(centerMatches, centerNo),
+                        "Center $centerNo ke ${centerMatches.size} matches mile — sahi wala chuno:"
+                    )
+                    if (idx < 0) {
+                        addBot("Theek hai, ye command chhod diya.")
+                        return
+                    }
+                    centerMatches[idx]
+                }
             }
         }
         val centerNoShown = lastSegment(center.centerCode).ifBlank { center.centerId }
@@ -352,55 +586,7 @@ fun ChatFillScreen(
         )
 
         // ---- e. Fill (wahi VerifyEngine: skip-if-verified + save + re-read verify) ----
-        val auditorId = app.secureStorage.getAuditorId()
-        if (auditorId.isNullOrBlank()) {
-            addBot(
-                "Auditor ID nahi mila. Prahari Connect me Auditor ID dalo, phir dobara try karo.",
-                isError = true
-            )
-            return
-        }
-        val masterR = app.prahariApi.getChecklistMaster(loan.category)
-        if (masterR.isFailure) {
-            addBot(
-                "Checklist master nahi mila (${loan.category}): ${masterR.exceptionOrNull()?.message}",
-                isError = true
-            )
-            return
-        }
-        val fillCustomer = entry.copy(
-            centerId = entry.centerId.ifBlank { center.centerId },
-            centerCode = entry.centerCode.ifBlank { center.centerCode },
-            disbursedAmount = entry.disbursedAmount.ifBlank {
-                memberMatches.firstOrNull { it.disbursedAmount.isNotBlank() }?.disbursedAmount ?: ""
-            }
-        )
-        addBot("Fill kar raha hun: ${fillCustomer.clientName} (${loan.category})…")
-        val result = VerifyEngine.fillOne(
-            api = app.prahariApi,
-            auditId = auditId,
-            auditorId = auditorId,
-            branchId = branchId,
-            category = loan.category,
-            customer = fillCustomer,
-            master = masterR.getOrNull() ?: emptyList(),
-            values = VerifyEngine.defaultValuesFor(fillCustomer)
-        )
-        when (result.status) {
-            VerifyResult.Status.VERIFIED -> addBot(
-                "✅ Verified: ${fillCustomer.clientName} • Center $centerNoShown • " +
-                    "Loan ${fillCustomer.disbursementId} • ₹${fillCustomer.disbursedAmount} • ${loan.category}"
-            )
-            VerifyResult.Status.SKIPPED_ALREADY_VERIFIED -> addBot(
-                "⏭️ Pehle se verified: ${fillCustomer.clientName} • Center $centerNoShown • " +
-                    "Loan ${fillCustomer.disbursementId} • ${loan.category} — dobara fill nahi kiya."
-            )
-            else -> addBot(
-                "❌ Fill fail: ${fillCustomer.clientName} • Loan ${fillCustomer.disbursementId} • " +
-                    "${loan.category} — ${result.message}",
-                isError = true
-            )
-        }
+        doFill(loan, center, centerNoShown, memberMatches)
     }
 
     fun onSend() {
@@ -459,7 +645,8 @@ fun ChatFillScreen(
                     OutlinedButton(onClick = { menuExpanded = true }) {
                         Text(
                             if (sel == null) "Audit chuno"
-                            else "${sel.branchName.ifBlank { sel.branchId }} — ${sel.name.ifBlank { sel.id }}"
+                            else "${sel.branchName.ifBlank { sel.branchId }} — ${sel.name.ifBlank { sel.id }}" +
+                                if (sel.branchId.isNotBlank()) " (Branch ID: ${sel.branchId})" else ""
                         )
                     }
                     DropdownMenu(
@@ -471,7 +658,8 @@ fun ChatFillScreen(
                                 text = {
                                     Text(
                                         "${a.branchName.ifBlank { a.branchId }} — " +
-                                            "${a.name.ifBlank { a.id }}"
+                                            "${a.name.ifBlank { a.id }}" +
+                                            if (a.branchId.isNotBlank()) " (ID: ${a.branchId})" else ""
                                     )
                                 },
                                 onClick = {

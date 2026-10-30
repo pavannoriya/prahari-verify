@@ -193,7 +193,8 @@ fun VerificationListScreen(
                     style = MaterialTheme.typography.titleMedium
                 )
                 Text(
-                    "Branch: ${VerifySession.branchName.ifBlank { branchId }}",
+                    "Branch: ${VerifySession.branchName.ifBlank { branchId }}" +
+                        if (branchId.isNotBlank()) " (ID: $branchId)" else "",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -301,6 +302,11 @@ fun VerificationListScreen(
                 Modifier.fillMaxSize(), contentAlignment = Alignment.Center
             ) {
                 Text("Is category me koi customer nahi hai ($category)")
+            }
+            customers.isEmpty() -> Box(
+                Modifier.fillMaxSize(), contentAlignment = Alignment.Center
+            ) {
+                Text("List load nahi hui — upar di gayi error dekho, phir Refresh dabao.")
             }
             visibleCustomers.isEmpty() -> Box(
                 Modifier.fillMaxSize(), contentAlignment = Alignment.Center
