@@ -294,7 +294,7 @@ fun ChatFillScreen(
         val earlyLists = mutableListOf<Pair<String, VerifyCustomer>>()
         val earlyErrors = mutableListOf<String>()
         for (cat in PrahariApi.CATEGORIES) {
-            val listR = app.prahariApi.getCustomerList(auditId, branchId, cat)
+            val listR = app.prahariApi.getCustomerList(audit.branchName, branchId, cat)
             if (listR.isFailure) {
                 earlyErrors.add("$cat: ${listR.exceptionOrNull()?.message}")
                 continue
@@ -535,7 +535,7 @@ fun ChatFillScreen(
         val found = mutableListOf<LoanOption>()
         val listErrors = mutableListOf<String>()
         for (cat in PrahariApi.CATEGORIES) {
-            val listR = app.prahariApi.getCustomerList(auditId, branchId, cat)
+            val listR = app.prahariApi.getCustomerList(audit.branchName, branchId, cat)
             if (listR.isFailure) {
                 listErrors.add("$cat: ${listR.exceptionOrNull()?.message}")
                 continue
