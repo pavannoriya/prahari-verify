@@ -463,7 +463,9 @@ fun ChatFillScreen(
             .filter { it.isNotBlank() }.joinToString(" ")
         addBot(
             "Center mil gaya: ${center.centerName.ifBlank { center.centerCode }} " +
-                "(${center.centerCode})" + if (meeting.isNotBlank()) " • $meeting" else ""
+                "(${center.centerCode}" +
+                (if (center.centerId.isNotBlank()) ", ID: ${center.centerId}" else "") + ")" +
+                if (meeting.isNotBlank()) " • $meeting" else ""
         )
 
         // ---- b. Member dhoondho (disbursements primary, customers fallback) ----
@@ -472,8 +474,10 @@ fun ChatFillScreen(
         var memberMatches: List<CenterMember> = emptyList()
         val disbR = app.prahariApi.getCenterDisbursements(center.centerId, asOn)
         if (disbR.isSuccess) {
-            memberMatches = (disbR.getOrNull() ?: emptyList())
-                .filter { codeMatches(memberNo, it.customerCode) }
+            val rows = disbR.getOrNull() ?: emptyList()
+            addBot("Disbursements se ${rows.size} rows mile.")
+            memberMatches = rows
+                .filter { codeMatches(memberNo, it.customerCode) || codeMatches(memberNo, it.memberNo) }
         } else {
             addBot(
                 "Disbursement list se nahi mila " +
@@ -484,7 +488,8 @@ fun ChatFillScreen(
             val custR = app.prahariApi.getCenterCustomers(center.centerId, asOn)
             if (custR.isSuccess) {
                 val fallback = custR.getOrNull() ?: emptyList()
-                val found = fallback.filter { codeMatches(memberNo, it.customerCode) }
+                addBot("Customer list se ${fallback.size} rows mile.")
+                val found = fallback.filter { codeMatches(memberNo, it.customerCode) || codeMatches(memberNo, it.memberNo) }
                 if (found.isNotEmpty()) {
                     memberMatches = found
                     addBot("Customer list se member mila.")
