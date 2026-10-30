@@ -1,7 +1,6 @@
 package com.prahari.verify.data.models
 
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonObject
 
 /** Assigned audit (AutoFill ke Audit model jaisa hi) */
 @Serializable
@@ -40,8 +39,8 @@ data class VerifyCustomer(
     val disbursementDate: String = "",
     /** List endpoint ne status diya ho to ("verified"/"audited"/"pending"), warna "" */
     val listStatus: String = "",
-    /** Debugging/display ke liye raw record (kabhi log me token ke saath mat bhejo) */
-    val raw: JsonObject? = null
+    /** List record me category ho to ("NTC"/"NTB"/"ETB") — list filter isi par chalta hai */
+    val category: String = ""
 )
 
 /** Chat Fill ke liye audit ka ek selected center (selected-centers response se) */
@@ -61,6 +60,8 @@ data class VerifyCenter(
  */
 data class CenterMember(
     val customerCode: String = "",
+    /** Member ka apna number (member part key se, ya poore code ke aakhri segment se) */
+    val memberNo: String = "",
     val memberName: String = "",
     val disbursementId: String = "",
     val customerInfoId: String = "",
