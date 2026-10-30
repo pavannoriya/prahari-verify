@@ -30,6 +30,8 @@ data class VerifyCustomer(
     val clientName: String = "",
     val centerId: String = "",
     val centerCode: String = "",
+    /** List record me ho to poora customer code (jaise "Jab:NAR:187:395:010"); na ho to "" */
+    val customerCode: String = "",
     val disbursedAmount: String = "",
     val principalOs: String = "",
     val arrears: String = "",
