@@ -171,6 +171,35 @@ class PrahariApi(private val secureStorage: SecureStorage) {
 
     /**
      * List/counts endpoints ka method pakka nahi hai (user ne sirf URL diya hai).
+     * Read endpoints (checklist-master, feedback) GET hain, isliye yahan GET pehle
+     * try hota hai; GET fail ho (ya success:false body de) to POST; dono fail hon
+     * to dono errors dikhte hain. (Purana postOrGet POST-pehle tha aur 500 par GET
+     * kabhi try nahi karta tha — Gadarwara par isi se "Branch not found" 500 atka tha.)
+     */
+    private suspend fun getOrPost(endpoint: String, params: Map<String, String>): Result<JsonElement> {
+        val query = params.entries.joinToString("&") { (k, v) ->
+            "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
+        }
+        fun isErrorBody(el: JsonElement?): Boolean {
+            return try {
+                el?.jsonObject?.get("success")?.jsonPrimitive?.booleanOrNull == false
+            } catch (_: Exception) {
+                false
+            }
+        }
+        val getResult = getElement("$BASE_URL$endpoint?$query")
+        if (getResult.isSuccess && !isErrorBody(getResult.getOrNull())) return getResult
+        val postResult = postElement(endpoint, params)
+        if (postResult.isSuccess && !isErrorBody(postResult.getOrNull())) return postResult
+        val getErr = getResult.exceptionOrNull()?.message
+            ?: if (isErrorBody(getResult.getOrNull())) "GET ne success:false diya" else "GET fail"
+        val postErr = postResult.exceptionOrNull()?.message
+            ?: if (isErrorBody(postResult.getOrNull())) "POST ne success:false diya" else "POST fail"
+        return Result.failure(Exception("GET: $getErr | POST: $postErr"))
+    }
+
+    /**
+     * List/counts endpoints ka method pakka nahi hai (user ne sirf URL diya hai).
      * Pehle POST try karta hai (app ka standard pattern). 404/405 aaye to GET try karta hai.
      * Dono fail ho to POST wali galti dikhata hai (saaf message ke saath).
      */
@@ -306,7 +335,7 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             "category" to category,
             "clientCategory" to category
         )
-        val r = postOrGet("/backend/audit/branch/ntb-ntc-data/", params)
+        val r = getOrPost("/backend/audit/branch/ntb-ntc-data/", params)
         return r.map { el ->
             val arr = findArray(el)
                 ?: throw Exception("Customer list me koi record nahi mila ($category). Response samajh nahi aaya.")
@@ -371,6 +400,19 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             clientName = o.str("client_name", "borrower_name", "customer_name", "applicant_name", "clientName"),
             centerId = o.str("center_id", "centerid", "centerId"),
             centerCode = o.str("center_code", "centercode", "centerCode"),
+            // Poora customer code: seedha code key se, na mile to center_code + member part se jodo
+            // (parseCenterMember wala pattern — Chat Fill ka center+member match isi par chalta hai)
+            customerCode = o.str(
+                "customercode", "customer_code", "customerCode",
+                "client_code", "clientcode", "member_code", "membercode"
+            ).ifBlank {
+                val cc = o.str("center_code", "centercode", "centerCode")
+                val mp = o.str(
+                    "cust_id", "custid", "member_no", "memberno",
+                    "member_number", "client_number"
+                )
+                if (cc.isNotBlank() && mp.isNotBlank()) "$cc:$mp" else ""
+            },
             disbursedAmount = o.str("disbursed_amount", "disbursedamt", "disbursedAmount", "disbursement_amount"),
             principalOs = o.str("principal_os", "principalos", "principalOs", "principal_outstanding"),
             arrears = o.str("total_arrears", "arrears", "totalArrears"),
@@ -393,7 +435,7 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             "category" to category,
             "clientCategory" to category
         )
-        val r = postOrGet("/backend/audit/branch/ntb-ntc-counts/", params)
+        val r = getOrPost("/backend/audit/branch/ntb-ntc-counts/", params)
         return r.map { el ->
             val o = findCountObject(el)
                 ?: throw Exception("Counts samajh nahi aaye ($category).")
@@ -446,15 +488,47 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             arr.mapNotNull { item ->
                 try {
                     val o = item.jsonObject
-                    val centerId = normalizeId(o.str("center_id", "centerid", "centerId", "id"))
-                    val centerCode = o.str("center_code", "centercode", "centerCode", "code")
+                    // Visit Plan jaisi keys: lowercase + CAPITALIZED dono (Centercode/CenterID
+                    // wale responses me lowercase parser sab items drop kar deta tha -> 0 centers)
+                    val centerId = normalizeId(o.str("center_id", "CenterID", "centerid", "centerId", "id"))
+                    val centerCode = o.str("center_code", "Centercode", "centercode", "centerCode", "code")
                     if (centerId.isBlank() && centerCode.isBlank()) return@mapNotNull null
                     VerifyCenter(
                         centerId = centerId,
                         centerCode = centerCode,
-                        centerName = o.str("center_name", "centername", "centerName", "name"),
-                        meetingDay = o.str("meeting_day", "meetingday", "meetingDay", "day"),
-                        meetingTime = o.str("meeting_time", "meetingtime", "meetingTime", "time"),
+                        centerName = o.str("center_name", "CenterName", "centername", "centerName", "name"),
+                        meetingDay = o.str("meeting_day", "CenterMeetingDay", "meetingday", "meetingDay", "day"),
+                        meetingTime = o.str("meeting_time", "CenterMeetingTime", "meetingtime", "meetingTime", "time"),
+                        branchId = o.str("branch_id", "branchId")
+                    )
+                } catch (_: Exception) { null }
+            }
+        }
+    }
+
+    /**
+     * Visit Plan wala tareeka: BRANCH ke saare centers.
+     * POST /backend/audit/centers/risk-details/ {branch_name} — "center_risks" array,
+     * CAPITALIZED keys (CenterID, Centercode, CenterName, CenterMeetingDay...).
+     * Selected-centers khaali ho (jaise Gadarwara 797) tab bhi branch ke centers mil jaate hain.
+     */
+    suspend fun getCentersByBranch(branchName: String): Result<List<VerifyCenter>> {
+        val r = postElement("/backend/audit/centers/risk-details/", mapOf("branch_name" to branchName))
+        return r.map { el ->
+            val arr = findArrayIn(el, listOf("center_risks", "centers", "data", "results", "list", "items", "rows"))
+                ?: throw Exception("Branch centers ki list samajh nahi aayi.")
+            arr.mapNotNull { item ->
+                try {
+                    val o = item.jsonObject
+                    val centerId = normalizeId(o.str("CenterID", "center_id", "centerId", "id"))
+                    val centerCode = o.str("Centercode", "center_code", "centercode", "centerCode")
+                    if (centerId.isBlank() && centerCode.isBlank()) return@mapNotNull null
+                    VerifyCenter(
+                        centerId = centerId,
+                        centerCode = centerCode,
+                        centerName = o.str("CenterName", "center_name", "centername", "centerName", "name"),
+                        meetingDay = o.str("CenterMeetingDay", "meeting_day", "meetingDay"),
+                        meetingTime = o.str("CenterMeetingTime", "meeting_time", "meetingTime"),
                         branchId = o.str("branch_id", "branchId")
                     )
                 } catch (_: Exception) { null }
