@@ -324,23 +324,29 @@ class PrahariApi(private val secureStorage: SecureStorage) {
 
     // ================= Customer list =================
     /**
-     * /backend/audit/branch/ntb-ntc-data/ — branch ka NTB/NTC customer list.
-     * Method confirm nahi hai: pehle POST (token + audit/branch/category body me),
-     * 404/405 par GET (query params me). Dono fail ho to saaf error.
+     * /backend/audit/branch/ntb-ntc-data/ — branch ka NTB/NTC/ETB customer list.
+     * WEBSITE-VERIFIED (DevTools, Gadarwara, 2026-10-30): POST-only, body me sirf
+     * branch_name + branch_id + as_on_date (kal ki date) + token. audit_id /
+     * category / clientCategory NAHI bhejte — wahi 500 "Branch not found in
+     * hierarchy" ki wajah the. Server sab categories ka data deta hai, isliye
+     * record me category field ho to usi se chhanto (koi match na ho to poori
+     * list wapas do, khaali list kabhi nahi).
      */
-    suspend fun getCustomerList(auditId: String, branchId: String, category: String): Result<List<VerifyCustomer>> {
+    suspend fun getCustomerList(branchName: String, branchId: String, category: String): Result<List<VerifyCustomer>> {
+        if (branchName.isBlank()) {
+            return Result.failure(Exception("Branch ka naam nahi mila — audit dobara chuno."))
+        }
         val params = mapOf(
-            "audit_id" to auditId,
+            "branch_name" to branchName,
             "branch_id" to branchId,
-            "category" to category,
-            "clientCategory" to category
+            "as_on_date" to yesterdayDate()
         )
-        val r = getOrPost("/backend/audit/branch/ntb-ntc-data/", params)
+        val r = postElement("/backend/audit/branch/ntb-ntc-data/", params)
         return r.map { el ->
             val arr = findArray(el)
                 ?: throw Exception("Customer list me koi record nahi mila ($category). Response samajh nahi aaya.")
             val seen = mutableSetOf<String>()
-            arr.mapNotNull { item ->
+            val all = arr.mapNotNull { item ->
                 try {
                     val o = item.jsonObject
                     val c = parseCustomer(o)
@@ -350,7 +356,34 @@ class PrahariApi(private val secureStorage: SecureStorage) {
                     c
                 } catch (_: Exception) { null }
             }
+            filterByCategory(all, category)
         }
+    }
+
+    /** Website ke mutabiq list/counts me as_on_date kal ki date hoti hai. */
+    private fun yesterdayDate(): String {
+        val cal = java.util.Calendar.getInstance()
+        cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
+    }
+
+    /**
+     * Record ke raw JSON me category jaisa field ho to us se chhanto.
+     * Koi record match na kare to poori list wapas do (galat guess se list
+     * khaali karne se behtar hai — user test par mixing bata dega).
+     */
+    private fun filterByCategory(list: List<VerifyCustomer>, category: String): List<VerifyCustomer> {
+        val want = category.trim().lowercase()
+        if (want.isBlank()) return list
+        val catKeys = listOf("category", "clientCategory", "client_category", "customer_category", "category_name", "segment")
+        val matched = list.filter { c ->
+            val raw = c.raw ?: return@filter false
+            catKeys.any { k ->
+                val v = raw[k]?.jsonPrimitive?.contentOrNull?.trim()?.lowercase() ?: return@any false
+                v == want || v.contains(want)
+            }
+        }
+        return if (matched.isNotEmpty()) matched else list
     }
 
     /** Object me data/results/customers/records/list/items array dhoondho, ya top-level array. */
@@ -426,18 +459,26 @@ class PrahariApi(private val secureStorage: SecureStorage) {
     // ================= Counts =================
     /**
      * /backend/audit/branch/ntb-ntc-counts/ — total/audited records + amounts.
-     * List jaisa hi POST-pehle-then-GET pattern.
+     * WEBSITE-VERIFIED (DevTools, Gadarwara, 2026-10-30): POST-only, body me sirf
+     * branch_name + branch_id + as_on_date (kal ki date) + token. Website ko
+     * 200 OK milta hai. Response me sab categories ke counts hote hain, isliye
+     * requested category ka hissa nikaal kar do.
      */
-    suspend fun getCounts(auditId: String, branchId: String, category: String): Result<VerifyCounts> {
+    suspend fun getCounts(branchName: String, branchId: String, category: String): Result<VerifyCounts> {
+        if (branchName.isBlank()) {
+            return Result.failure(Exception("Branch ka naam nahi mila — audit dobara chuno."))
+        }
         val params = mapOf(
-            "audit_id" to auditId,
+            "branch_name" to branchName,
             "branch_id" to branchId,
-            "category" to category,
-            "clientCategory" to category
+            "as_on_date" to yesterdayDate()
         )
-        val r = getOrPost("/backend/audit/branch/ntb-ntc-counts/", params)
+        val r = postElement("/backend/audit/branch/ntb-ntc-counts/", params)
         return r.map { el ->
-            val o = findCountObject(el)
+            // Category key par seedha number ho ({"NTC": 200}) to wahi total hai
+            val catNum = findCategoryNumber(el, category)
+            if (catNum != null) return@map VerifyCounts(totalRecords = catNum)
+            val o = findCountObject(el, category)
                 ?: throw Exception("Counts samajh nahi aaye ($category).")
             fun intVal(vararg keys: String): Int {
                 for (k in keys) {
@@ -457,19 +498,54 @@ class PrahariApi(private val secureStorage: SecureStorage) {
         }
     }
 
-    private fun findCountObject(el: JsonElement): JsonObject? {
+    /**
+     * Counts response se requested category ka object dhoondho: seedha top
+     * level par, category key ke andar ({"NTC": {...}}), ya data/counts/
+     * summary/result ke andar (usme bhi category key ho sakti hai).
+     */
+    private fun findCountObject(el: JsonElement, category: String): JsonObject? {
         if (el !is JsonObject) return null
         val countKeys = setOf(
             "total_records", "totalRecords", "total", "audited_records",
             "auditedRecords", "audited", "verified_records", "verified"
         )
-        if (el.keys.any { it in countKeys }) return el
+        fun hasCountKeys(o: JsonObject) = o.keys.any { it in countKeys }
+        if (hasCountKeys(el)) return el
+        val candidates = mutableListOf<JsonObject>()
+        fun addCategoryObject(obj: JsonObject) {
+            if (category.isBlank()) return
+            val k = obj.keys.firstOrNull { it.equals(category, ignoreCase = true) } ?: return
+            (obj[k] as? JsonObject)?.let { candidates.add(it) }
+        }
+        addCategoryObject(el)
         for (key in listOf("data", "counts", "summary", "result")) {
             val v = el[key]
             if (v is JsonObject) {
-                val nested = findCountObject(v)
-                if (nested != null) return nested
+                candidates.add(v)
+                addCategoryObject(v)
             }
+        }
+        for (c in candidates) {
+            if (hasCountKeys(c)) return c
+            for (key in listOf("data", "counts", "summary", "result")) {
+                val v = c[key]
+                if (v is JsonObject && hasCountKeys(v)) return v
+            }
+        }
+        return null
+    }
+
+    /** Category key par seedha number ho ({"NTC": 200}) to wahi total. */
+    private fun findCategoryNumber(el: JsonElement, category: String): Int? {
+        if (el !is JsonObject || category.isBlank()) return null
+        fun numOf(obj: JsonObject): Int? {
+            val k = obj.keys.firstOrNull { it.equals(category, ignoreCase = true) } ?: return null
+            return obj[k]?.jsonPrimitive?.intOrNull
+        }
+        numOf(el)?.let { return it }
+        for (key in listOf("data", "counts", "summary", "result")) {
+            val v = el[key]
+            if (v is JsonObject) numOf(v)?.let { return it }
         }
         return null
     }
