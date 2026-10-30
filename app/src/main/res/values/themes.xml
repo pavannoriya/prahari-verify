@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.PrahariVerify" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#1a73e8</item>
+        <item name="android:navigationBarColor">#ffffff</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
