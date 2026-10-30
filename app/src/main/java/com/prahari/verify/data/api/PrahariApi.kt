@@ -342,9 +342,11 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             "as_on_date" to yesterdayDate()
         )
         val r = postElement("/backend/audit/branch/ntb-ntc-data/", params)
-        return r.map { el ->
+        if (r.isFailure) return Result.failure(r.exceptionOrNull() ?: Exception("Customer list nahi mili."))
+        return try {
+            val el = r.getOrNull() ?: return Result.failure(Exception("Customer list khaali mili."))
             val arr = findArray(el)
-                ?: throw Exception("Customer list me koi record nahi mila ($category). Response samajh nahi aaya.")
+                ?: return Result.failure(Exception("Customer list me koi record nahi mila ($category). Response samajh nahi aaya."))
             val seen = mutableSetOf<String>()
             val all = arr.mapNotNull { item ->
                 try {
@@ -356,7 +358,10 @@ class PrahariApi(private val secureStorage: SecureStorage) {
                     c
                 } catch (_: Exception) { null }
             }
-            filterByCategory(all, category)
+            Result.success(filterByCategory(all, category))
+        } catch (e: Exception) {
+            // Parse ki koi bhi galti clean failure bane — load() kabhi na toote.
+            Result.failure(e)
         }
     }
 
@@ -424,10 +429,12 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             else -> ""
         }
         return VerifyCustomer(
-            disbursementId = o.str("disbursementid", "disbursement_id", "disbursementId", "loan_id", "loanId", "loanID"),
-            customerInfoId = o.str("customerinfoid", "customer_info_id", "customerInfoId", "customer_id"),
+            // IDs parse ke waqt normalize ("11506854.0" -> "11506854") taaki
+            // list-search me ID match format farak se na toote.
+            disbursementId = normalizeId(o.str("disbursementid", "disbursement_id", "disbursementId", "loan_id", "loanId", "loanID")),
+            customerInfoId = normalizeId(o.str("customerinfoid", "customer_info_id", "customerInfoId", "customer_id")),
             clientName = o.str("client_name", "borrower_name", "customer_name", "applicant_name", "clientName"),
-            centerId = o.str("center_id", "centerid", "centerId"),
+            centerId = normalizeId(o.str("center_id", "centerid", "centerId")),
             centerCode = o.str("center_code", "centercode", "centerCode"),
             // Poora customer code: seedha code key se, na mile to center_code + member part se jodo
             // (parseCenterMember wala pattern — Chat Fill ka center+member match isi par chalta hai)
@@ -457,8 +464,10 @@ class PrahariApi(private val secureStorage: SecureStorage) {
      * /backend/audit/branch/ntb-ntc-counts/ — total/audited records + amounts.
      * WEBSITE-VERIFIED (DevTools, Gadarwara, 2026-10-30): POST-only, body me sirf
      * branch_name + branch_id + as_on_date (kal ki date) + token. Website ko
-     * 200 OK milta hai. Response me sab categories ke counts hote hain, isliye
-     * requested category ka hissa nikaal kar do.
+     * 200 OK milta hai. Response format (user-shared Preview):
+     * {success: true, counts: [{type: "ntc_count", loan_count: 200}, ...]}.
+     * Parse ki koi bhi galti clean failure banti hai (kabhi throw nahi) taaki
+     * load() kabhi na toote aur list phir bhi dikhe.
      */
     suspend fun getCounts(branchName: String, branchId: String, category: String): Result<VerifyCounts> {
         if (branchName.isBlank()) {
@@ -470,12 +479,16 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             "as_on_date" to yesterdayDate()
         )
         val r = postElement("/backend/audit/branch/ntb-ntc-counts/", params)
-        return r.map { el ->
+        if (r.isFailure) return Result.failure(r.exceptionOrNull() ?: Exception("Counts nahi mile."))
+        return try {
+            val el = r.getOrNull() ?: return Result.failure(Exception("Counts khaali mile."))
+            // Website format: counts array me type + loan_count
+            findCountsArrayEntry(el, category)?.let { return Result.success(it) }
             // Category key par seedha number ho ({"NTC": 200}) to wahi total hai
             val catNum = findCategoryNumber(el, category)
-            if (catNum != null) return@map VerifyCounts(totalRecords = catNum)
+            if (catNum != null) return Result.success(VerifyCounts(totalRecords = catNum))
             val o = findCountObject(el, category)
-                ?: throw Exception("Counts samajh nahi aaye ($category).")
+                ?: return Result.failure(Exception("Counts samajh nahi aaye ($category)."))
             fun intVal(vararg keys: String): Int {
                 for (k in keys) {
                     val p = o[k]?.jsonPrimitive ?: continue
@@ -484,14 +497,51 @@ class PrahariApi(private val secureStorage: SecureStorage) {
                 }
                 return 0
             }
-            VerifyCounts(
-                totalRecords = intVal("total_records", "totalRecords", "total", "total_customers"),
-                auditedRecords = intVal("audited_records", "auditedRecords", "audited", "verified_records", "verified"),
-                disbursedAmount = o.str("disbursed_amount", "disbursedamt", "total_disbursed"),
-                principalOs = o.str("principal_os", "principalos"),
-                totalArrears = o.str("total_arrears", "arrears")
+            Result.success(
+                VerifyCounts(
+                    totalRecords = intVal("total_records", "totalRecords", "total", "total_customers"),
+                    auditedRecords = intVal("audited_records", "auditedRecords", "audited", "verified_records", "verified"),
+                    disbursedAmount = o.str("disbursed_amount", "disbursedamt", "total_disbursed"),
+                    principalOs = o.str("principal_os", "principalos"),
+                    totalArrears = o.str("total_arrears", "arrears")
+                )
             )
+        } catch (e: Exception) {
+            Result.failure(e)
         }
+    }
+
+    /**
+     * Website counts format: {success, counts: [{type: "ntc_count", loan_count: 200}, ...]}.
+     * Requested category ki entry ka loan_count total hai; audited wali entry
+     * (ntc_audited / ntc_verified) ho to wo audited hai, na ho to 0.
+     */
+    private fun findCountsArrayEntry(el: JsonElement, category: String): VerifyCounts? {
+        if (el !is JsonObject) return null
+        val arr = (el["counts"] as? JsonArray)
+            ?: ((el["data"] as? JsonObject)?.get("counts") as? JsonArray)
+            ?: return null
+        val want = category.trim().lowercase()
+        if (want.isBlank()) return null
+        fun loanCountOf(entry: JsonObject): Int? {
+            val p = entry["loan_count"] ?: entry["count"] ?: entry["total"] ?: entry["value"] ?: return null
+            val prim = p as? JsonPrimitive ?: return null
+            prim.intOrNull?.let { return it }
+            return prim.contentOrNull?.filter { c -> c.isDigit() }?.toIntOrNull()
+        }
+        var total: Int? = null
+        var audited = 0
+        for (item in arr) {
+            val o = item as? JsonObject ?: continue
+            val t = o["type"]?.jsonPrimitive?.contentOrNull?.trim()?.lowercase() ?: continue
+            val n = loanCountOf(o) ?: continue
+            when (t) {
+                "${want}_count" -> total = n
+                "${want}_audited", "${want}_verified", "${want}_audited_count", "${want}_verified_count" -> audited = n
+            }
+        }
+        if (total == null) return null
+        return VerifyCounts(totalRecords = total, auditedRecords = audited)
     }
 
     /**
