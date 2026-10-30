@@ -368,20 +368,16 @@ class PrahariApi(private val secureStorage: SecureStorage) {
     }
 
     /**
-     * Record ke raw JSON me category jaisa field ho to us se chhanto.
+     * Record ki parsed category se chhanto (parse ke waqt hi nikaal li jaati hai).
      * Koi record match na kare to poori list wapas do (galat guess se list
      * khaali karne se behtar hai — user test par mixing bata dega).
      */
     private fun filterByCategory(list: List<VerifyCustomer>, category: String): List<VerifyCustomer> {
         val want = category.trim().lowercase()
         if (want.isBlank()) return list
-        val catKeys = listOf("category", "clientCategory", "client_category", "customer_category", "category_name", "segment")
         val matched = list.filter { c ->
-            val raw = c.raw ?: return@filter false
-            catKeys.any { k ->
-                val v = raw[k]?.jsonPrimitive?.contentOrNull?.trim()?.lowercase() ?: return@any false
-                v == want || v.contains(want)
-            }
+            val v = c.category.trim().lowercase()
+            v.isNotBlank() && (v == want || v.contains(want))
         }
         return if (matched.isNotEmpty()) matched else list
     }
@@ -452,7 +448,7 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             bucket = o.str("bucket", "bucket_days", "arrear_bucket"),
             disbursementDate = o.str("disbursement_date", "disbursementdate", "disbursementDate"),
             listStatus = listStatus,
-            raw = o
+            category = o.str("category", "clientCategory", "client_category", "customer_category", "category_name", "segment")
         )
     }
 
@@ -690,6 +686,12 @@ class PrahariApi(private val secureStorage: SecureStorage) {
             centerCode.isNotBlank() && memberPart.isNotBlank() -> "$centerCode:$memberPart"
             else -> ""
         }
+        // Member ka apna number: seedha member part se, na mile to poore code
+        // ke aakhri segment se. Isse member match poore code par depend nahi karta
+        // (code khaali ho tab bhi member mil jaata hai).
+        val memberNo = memberPart.ifBlank {
+            if (fullCode.isNotBlank()) fullCode.split(":").map { it.trim() }.filter { it.isNotEmpty() }.lastOrNull() ?: "" else ""
+        }
         val disbId = normalizeId(
             o.str("disbursementid", "disbursement_id", "disbursementId", "loan_id", "loanid", "loanId")
         )
@@ -699,6 +701,7 @@ class PrahariApi(private val secureStorage: SecureStorage) {
         if (fullCode.isBlank() && disbId.isBlank() && infoId.isBlank()) return null
         return CenterMember(
             customerCode = fullCode,
+            memberNo = memberNo,
             memberName = o.str(
                 "applicantname", "applicant_name", "client_name",
                 "customer_name", "borrower_name", "name"
